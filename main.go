@@ -18,7 +18,7 @@ import (
 const (
 	maxOutputSize    = 512 * 1024
 	maxSourceSize    = 100 * 1024
-	maxCompileTime   = 20 * time.Second
+	maxCompileTime   = 30 * time.Second
 	maxExecTime      = 10 * time.Second
 	workspaceDir     = "/tmp/codhoot-workspace"
 )
@@ -160,36 +160,35 @@ func runGo(jobDir, source string) (compileMs, execMs int64, output string, exitC
 		return 0, 0, fmt.Sprintf("Failed to write source: %v", err), -1, false, false
 	}
 
+	binPath := filepath.Join(jobDir, "main")
+
+	// Compile
 	compileStart := time.Now()
 	compileCtx, compileCancel := context.WithTimeout(context.Background(), maxCompileTime)
 	defer compileCancel()
 
-	compileCmd := exec.CommandContext(compileCtx, "go", "run", "main.go")
+	compileCmd := exec.CommandContext(compileCtx, "go", "build", "-o", binPath, "main.go")
 	compileCmd.Dir = jobDir
-	var compileStderr strings.Builder
-	compileCmd.Stdout = &strings.Builder{}
-	compileCmd.Stderr = &compileStderr
-
-	compileErr := compileCmd.Run()
+	compileOutput, compileErr := compileCmd.CombinedOutput()
 	compileMs = time.Since(compileStart).Milliseconds()
 
 	if compileCtx.Err() == context.DeadlineExceeded {
-		return compileMs, 0, "Compilation timed out (limit: 20s)", -1, true, false
+		return compileMs, 0, "Compilation timed out (limit: 30s)", -1, true, false
 	}
 
 	if compileErr != nil {
-		errOutput := strings.TrimSpace(compileStderr.String())
+		errOutput := strings.TrimSpace(string(compileOutput))
 		if errOutput == "" {
 			errOutput = compileErr.Error()
 		}
 		return compileMs, 0, errOutput, 1, false, false
 	}
 
+	// Execute
 	execStart := time.Now()
 	execCtx, execCancel := context.WithTimeout(context.Background(), maxExecTime)
 	defer execCancel()
 
-	binPath := filepath.Join(jobDir, "main")
 	execCmd := exec.CommandContext(execCtx, binPath)
 	execCmd.Dir = jobDir
 	var stdout, stderr strings.Builder

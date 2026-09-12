@@ -18,9 +18,10 @@ import (
 const (
 	maxOutputSize    = 512 * 1024
 	maxSourceSize    = 100 * 1024
-	maxCompileTime   = 30 * time.Second
+	maxCompileTime   = 45 * time.Second
 	maxExecTime      = 10 * time.Second
 	workspaceDir     = "/tmp/codhoot-workspace"
+	gocacheDir       = "/tmp/gocache"
 )
 
 type CompileRequest struct {
@@ -50,7 +51,12 @@ func main() {
 	}
 
 	os.MkdirAll(workspaceDir, 0755)
+	os.MkdirAll(gocacheDir, 0755)
 	defer os.RemoveAll(workspaceDir)
+
+	// Set Go build cache and temp dir for faster compilations
+	os.Setenv("GOCACHE", gocacheDir)
+	os.Setenv("GOTMPDIR", workspaceDir)
 
 	if _, err := exec.LookPath("go"); err != nil {
 		log.Fatalf("go not found: %v", err)
@@ -67,9 +73,9 @@ func main() {
 	server := &http.Server{
 		Addr:         ":" + port,
 		Handler:      handler,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  60 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	go func() {

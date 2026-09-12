@@ -1,8 +1,8 @@
 FROM golang:1.26-alpine
 RUN apk add --no-cache gcc musl-dev && \
     adduser -D -u 1000 runner && \
-    mkdir -p /workspace /tmp/gocache && \
-    chown -R runner:runner /workspace /tmp/gocache
+    mkdir -p /workspace /tmp/gocache /tmp/codhoot-workspace && \
+    chown -R runner:runner /workspace /tmp/gocache /tmp/codhoot-workspace
 WORKDIR /app
 COPY go.mod .
 COPY main.go .

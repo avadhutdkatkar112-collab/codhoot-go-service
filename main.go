@@ -95,7 +95,7 @@ func main() {
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(HealthResponse{
 		Status:    "healthy",
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
@@ -103,7 +103,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]string{
 		"service": "codhoot-go-compiler",
 		"version": "1.0.0",
@@ -151,7 +151,7 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 		resp.Error = "Execution failed"
 	}
 
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(resp)
 
@@ -229,7 +229,7 @@ func runGo(jobDir, source string) (compileMs, execMs int64, output string, exitC
 }
 
 func writeError(w http.ResponseWriter, status int, message string, compileMs, execMs int64) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(CompileResponse{
 		Success:     false,

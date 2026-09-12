@@ -1,12 +1,15 @@
-FROM golang:1.22-alpine AS builder
+FROM golang:1.26-alpine
+RUN apk add --no-cache gcc musl-dev && \
+    adduser -D -u 1000 runner && \
+    mkdir -p /workspace /tmp/gocache && \
+    chown -R runner:runner /workspace /tmp/gocache
 WORKDIR /app
 COPY go.mod .
 COPY main.go .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o codhoot-go-service .
-
-FROM golang:1.22-alpine
-WORKDIR /app
-COPY --from=builder /app/codhoot-go-service .
+RUN go build -ldflags="-s -w" -o codhoot-go-service .
+RUN chown runner:runner codhoot-go-service && \
+    chmod +x codhoot-go-service
 ENV PORT=8086
 EXPOSE 8086
+USER runner
 CMD ["./codhoot-go-service"]

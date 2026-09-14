@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,17 +13,21 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
 const (
-	maxOutputSize    = 512 * 1024
-	maxSourceSize    = 100 * 1024
-	maxCompileTime   = 60 * time.Second
-	maxExecTime      = 10 * time.Second
-	workspaceDir     = "/tmp/codhoot-workspace"
-	gocacheDir       = "/tmp/gocache"
+	maxOutputSize     = 512 * 1024 // 512KB
+	maxSourceSize     = 100 * 1024 // 100KB
+	maxCompileTime    = 60 * time.Second
+	maxExecTime       = 10 * time.Second
+	maxConcurrentJobs = 4
+	workspaceDir      = "/tmp/codhoot-workspace"
+	cacheDir          = "/tmp/codhoot-cache"
+	gocacheDir        = "/tmp/gocache"
+	srcFilename       = "main.go"
 )
 
 type CompileRequest struct {
@@ -44,27 +50,67 @@ type HealthResponse struct {
 	Timestamp string `json:"timestamp"`
 }
 
+// jobSem bounds concurrent compiler+runner processes so a burst of students
+// cannot OOM the 512MB free-tier container (which would restart it and wipe
+// every warm cache). Requests queue up to their own deadline instead.
+var jobSem = make(chan struct{}, maxConcurrentJobs)
+
+// artifactCache is a tiny FIFO cache keyed by sha256(source) -> compiled binary.
+// Identical lesson/tutorial code is the dominant workload; compiling it once and
+// reusing the artifact turns repeat runs from seconds into milliseconds.
+var (
+	cacheMu    sync.Mutex
+	cacheLRU   = make(map[string]string) // hash -> artifact path
+	cacheOrder []string                  // FIFO eviction order
+	maxCache   = 64
+)
+
+func cacheGet(hash string) (string, bool) {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	p, ok := cacheLRU[hash]
+	return p, ok
+}
+
+func cachePut(hash, path string) {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	cacheLRU[hash] = path
+	cacheOrder = append(cacheOrder, hash)
+	if len(cacheOrder) > maxCache {
+		old := cacheOrder[0]
+		cacheOrder = cacheOrder[1:]
+		if oldPath, ok := cacheLRU[old]; ok {
+			os.Remove(oldPath)
+			delete(cacheLRU, old)
+		}
+	}
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8086"
+		port = "8081"
 	}
 
 	os.MkdirAll(workspaceDir, 0755)
+	os.MkdirAll(cacheDir, 0755)
 	os.MkdirAll(gocacheDir, 0755)
 	defer os.RemoveAll(workspaceDir)
 
-	// Set Go build cache and temp dir for faster compilations
+	// Warm the Go build cache so the first student compile does not rebuild the
+	// entire stdlib on a 0.1 CPU instance.
 	os.Setenv("GOCACHE", gocacheDir)
 	os.Setenv("GOTMPDIR", workspaceDir)
 
 	if _, err := exec.LookPath("go"); err != nil {
 		log.Fatalf("go not found: %v", err)
 	}
-	log.Println("Go found, ready to execute")
+	log.Println("Go found, ready to compile")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /compile", handleCompile)
+	mux.HandleFunc("GET /health/live", handleHealth)
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /", handleIndex)
 
@@ -73,9 +119,9 @@ func main() {
 	server := &http.Server{
 		Addr:         ":" + port,
 		Handler:      handler,
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: maxCompileTime + 10*time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	go func() {
@@ -88,7 +134,7 @@ func main() {
 		server.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("Go Compiler Service listening on :%s", port)
+	log.Printf("C Compiler Service listening on :%s", port)
 	if err := server.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("Server error: %v", err)
 	}
@@ -105,10 +151,47 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 func handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]string{
-		"service": "codhoot-go-compiler",
-		"version": "1.0.0",
+		"service": "codhoot-c-compiler",
+		"version": "2.0.0",
 		"usage":   "POST /compile with {\"source\": \"...\"}",
 	})
+}
+
+// runCommand runs a compiler/runner, killing the whole process group on
+// timeout so orphaned children (cc1, as, ld) never accumulate on the
+// 512MB container.
+func runCommand(parent context.Context, timeout time.Duration, dir string, name string, args ...string) ([]byte, int, bool) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	killGroup := func() {
+		for i := 0; i < 200 && (cmd.Process == nil || cmd.Process.Pid <= 0); i++ {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if cmd.Process != nil && cmd.Process.Pid > 0 {
+			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+	}
+	go func() {
+		<-ctx.Done()
+		killGroup()
+	}()
+
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return out, -1, true
+	}
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return out, ee.ExitCode(), false
+		}
+		return out, 1, false
+	}
+	return out, 0, false
 }
 
 func handleCompile(w http.ResponseWriter, r *http.Request) {
@@ -130,12 +213,27 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jobID := fmt.Sprintf("%d", time.Now().UnixNano())
+	// Bound concurrency: queue up to the request deadline instead of spawning
+	// unlimited compilers that would OOM the container.
+	select {
+	case jobSem <- struct{}{}:
+		defer func() { <-jobSem }()
+	case <-r.Context().Done():
+		writeError(w, http.StatusServiceUnavailable, "Compiler is busy, try again", 0, 0)
+		return
+	}
+
+	// deterministic artifact reuse for identical source
+	sum := sha256.Sum256([]byte(req.Source))
+	hash := hex.EncodeToString(sum[:])
+	artifact, cacheHit := cacheGet(hash)
+
+	jobID := fmt.Sprintf("%d-%s", time.Now().UnixNano(), hash[:8])
 	jobDir := filepath.Join(workspaceDir, jobID)
 	os.MkdirAll(jobDir, 0755)
 	defer os.RemoveAll(jobDir)
 
-	compileMs, execMs, output, exitCode, timeout, truncated := runGo(jobDir, req.Source)
+	compileMs, execMs, output, exitCode, timeout, truncated := compileAndRun(jobDir, req.Source, artifact, cacheHit, hash)
 
 	resp := CompileResponse{
 		Success:         exitCode == 0,
@@ -148,84 +246,72 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if exitCode != 0 && output == "" {
-		resp.Error = "Execution failed"
+		resp.Error = "Compilation or execution failed"
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(resp)
 
-	totalMs := time.Since(start).Milliseconds()
-	log.Printf("Run: exit=%d compile=%dms exec=%dms total=%dms timeout=%v",
-		exitCode, compileMs, execMs, totalMs, timeout)
+	log.Printf("Compile: exit=%d compile=%dms exec=%dms total=%dms timeout=%v cached=%v",
+		exitCode, compileMs, execMs, time.Since(start).Milliseconds(), timeout, cacheHit)
 }
 
-func runGo(jobDir, source string) (compileMs, execMs int64, output string, exitCode int, timeout, truncated bool) {
-	srcFile := filepath.Join(jobDir, "main.go")
+func compileAndRun(jobDir, source, cachedArtifact string, cacheHit bool, hash string) (compileMs, execMs int64, output string, exitCode int, timeout, truncated bool) {
+	srcFile := filepath.Join(jobDir, srcFilename)
 	if err := os.WriteFile(srcFile, []byte(source), 0644); err != nil {
 		return 0, 0, fmt.Sprintf("Failed to write source: %v", err), -1, false, false
 	}
 
-	binPath := filepath.Join(jobDir, "main")
-
-	// Compile
+	binFile := filepath.Join(jobDir, "main")
+	compileOutput, compileCode, compileTimedOut := []byte{}, 0, false
 	compileStart := time.Now()
-	compileCtx, compileCancel := context.WithTimeout(context.Background(), maxCompileTime)
-	defer compileCancel()
 
-	compileCmd := exec.CommandContext(compileCtx, "go", "build", "-o", binPath, "main.go")
-	compileCmd.Dir = jobDir
-	compileOutput, compileErr := compileCmd.CombinedOutput()
-	compileMs = time.Since(compileStart).Milliseconds()
+	if cacheHit && cachedArtifact != "" {
+		binFile = cachedArtifact
+	} else {
+		// Compile into the persistent cache dir so the artifact survives across
+		// requests (jobDir is cleaned up after every run).
+		cacheArtifact := filepath.Join(cacheDir, hash+".bin")
+		if _, err := os.Stat(cacheArtifact); err == nil {
+			binFile = cacheArtifact
+			cachePut(hash, cacheArtifact)
+		} else {
+			compileOutput, compileCode, compileTimedOut = runCommand(
+				context.Background(), maxCompileTime, jobDir,
+				"go", "build", "-o", cacheArtifact, srcFile,
+			)
+			compileMs = time.Since(compileStart).Milliseconds()
+			if compileCode == 0 {
+				cachePut(hash, cacheArtifact)
+				binFile = cacheArtifact
+			}
+		}
+	}
 
-	if compileCtx.Err() == context.DeadlineExceeded {
+	if compileTimedOut {
 		return compileMs, 0, "Compilation timed out (limit: 60s)", -1, true, false
 	}
-
-	if compileErr != nil {
-		errOutput := strings.TrimSpace(string(compileOutput))
-		if errOutput == "" {
-			errOutput = compileErr.Error()
-		}
-		return compileMs, 0, errOutput, 1, false, false
+	if compileCode != 0 {
+		return compileMs, 0, string(compileOutput), compileCode, false, false
 	}
 
-	// Execute
+	// Execute on a fresh filesystem tree per request (jobDir), so programs that
+	// write files do not interfere with other users' runs.
 	execStart := time.Now()
-	execCtx, execCancel := context.WithTimeout(context.Background(), maxExecTime)
-	defer execCancel()
-
-	execCmd := exec.CommandContext(execCtx, binPath)
-	execCmd.Dir = jobDir
-	var stdout, stderr strings.Builder
-	execCmd.Stdout = &stdout
-	execCmd.Stderr = &stderr
-
-	execErr := execCmd.Run()
+	execOutput, execCode, execTimedOut := runCommand(context.Background(), maxExecTime, jobDir, binFile)
 	execMs = time.Since(execStart).Milliseconds()
-
-	if execCtx.Err() == context.DeadlineExceeded {
+	if execTimedOut {
 		return compileMs, execMs, "Execution timed out (limit: 10s)", -1, true, false
 	}
 
-	combinedOutput := stdout.String() + stderr.String()
+	combinedOutput := string(execOutput)
 	if len(combinedOutput) > maxOutputSize {
 		combinedOutput = combinedOutput[:maxOutputSize] + "\n... [output truncated]"
 		truncated = true
 	}
 
-	output = combinedOutput
-	if execErr != nil {
-		if exitErr, ok := execErr.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = 1
-		}
-	} else {
-		exitCode = 0
-	}
-
-	return
+	return compileMs, execMs, combinedOutput, execCode, false, truncated
 }
 
 func writeError(w http.ResponseWriter, status int, message string, compileMs, execMs int64) {

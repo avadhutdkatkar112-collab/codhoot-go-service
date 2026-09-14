@@ -18,7 +18,7 @@ import (
 const (
 	maxOutputSize    = 512 * 1024
 	maxSourceSize    = 100 * 1024
-	maxCompileTime   = 45 * time.Second
+	maxCompileTime   = 60 * time.Second
 	maxExecTime      = 10 * time.Second
 	workspaceDir     = "/tmp/codhoot-workspace"
 	gocacheDir       = "/tmp/gocache"
@@ -179,7 +179,7 @@ func runGo(jobDir, source string) (compileMs, execMs int64, output string, exitC
 	compileMs = time.Since(compileStart).Milliseconds()
 
 	if compileCtx.Err() == context.DeadlineExceeded {
-		return compileMs, 0, "Compilation timed out (limit: 30s)", -1, true, false
+		return compileMs, 0, "Compilation timed out (limit: 60s)", -1, true, false
 	}
 
 	if compileErr != nil {

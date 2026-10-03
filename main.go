@@ -32,6 +32,10 @@ const (
 
 type CompileRequest struct {
 	Source string `json:"source"`
+	// Files plus EntryFile enable the multi-file contract the backend uses.
+	// Source is still accepted so older callers keep working.
+	Files     map[string]string `json:"files,omitempty"`
+	EntryFile string            `json:"entry_file,omitempty"`
 }
 
 type CompileResponse struct {
@@ -236,9 +240,13 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if strings.TrimSpace(req.Source) == "" {
-		writeError(w, http.StatusBadRequest, "Source code is required", 0, 0)
-		return
+	// A multi-file request carries no source field; resolveEntry validates the
+	// file set instead, so these single-source checks apply only when it is absent.
+	if len(req.Files) == 0 {
+		if strings.TrimSpace(req.Source) == "" {
+			writeError(w, http.StatusBadRequest, "Source code is required", 0, 0)
+			return
+		}
 	}
 
 	if len(req.Source) > maxSourceSize {
@@ -299,13 +307,13 @@ func handleCompile(w http.ResponseWriter, r *http.Request) {
 }
 
 func compileAndRun(uid uint32, jobDir, source, cachedArtifact string, cacheHit bool, hash string) (compileMs, execMs int64, output string, exitCode int, timeout, truncated bool) {
-	srcFile := filepath.Join(jobDir, srcFilename)
-	if err := os.WriteFile(srcFile, []byte(source), 0644); err != nil {
-		return 0, 0, fmt.Sprintf("Failed to write source: %v", err), -1, false, false
+	ep, err := resolveEntry(source, nil, "", srcFilename)
+	if err != nil {
+		return 0, 0, fmt.Sprintf("Failed to validate source: %v", err), -1, false, false
 	}
-	// Hand the source to the sandbox uid so the unprivileged compiler can read it.
-	if err := chownToSandbox(srcFile, uid); err != nil {
-		return 0, 0, fmt.Sprintf("Failed to stage source: %v", err), -1, false, false
+	srcFile, werr := writeEntry(jobDir, ep, uid)
+	if werr != nil {
+		return 0, 0, fmt.Sprintf("Failed to stage source: %v", werr), -1, false, false
 	}
 
 	// The compiler parses untrusted input, so it runs untrusted and confined to

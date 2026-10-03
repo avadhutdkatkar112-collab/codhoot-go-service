@@ -7,6 +7,21 @@ WORKDIR /app
 # harden.go (portable) plus harden_unix.go / harden_other.go (per-platform).
 COPY go.mod ./
 COPY main.go harden.go harden_unix.go harden_other.go ./
+# Pre-warm the shared Go build cache with the entire standard library.
+#
+# This is the single biggest latency lever for Go. A cold GOCACHE forces every
+# compilation to rebuild the whole stdlib from source, which measured 8000ms per
+# hello-world locally and would be far worse on Render's 0.1 CPU, blowing past
+# the 60s compile cap. Pre-warming at image build turns that into a cache hit.
+#
+# The cache is shared and writable so the compiler can record new entries. That is
+# a different risk from the compiled-artifact cache, which stores finished
+# binaries that get executed: GOCACHE holds content-addressed intermediate
+# objects, and the linked binary is produced fresh by each `go build -o`.
+RUN mkdir -p /opt/gocache && GOCACHE=/opt/gocache go build std && chmod -R 0777 /opt/gocache
+ENV GOCACHE=/opt/gocache
+ENV GOFLAGS=-mod=mod
+ENV GOPROXY=off
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /app/service .
 RUN chmod 0755 /app/service && rm -f go.mod main.go harden.go harden_unix.go harden_other.go
 

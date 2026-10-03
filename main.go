@@ -23,7 +23,7 @@ const (
 	maxSourceSize     = 100 * 1024 // 100KB
 	maxCompileTime    = 60 * time.Second
 	maxExecTime       = 10 * time.Second
-	maxConcurrentJobs = 4
+	maxConcurrentJobs = 8
 	workspaceDir      = "/tmp/codhoot-workspace"
 	cacheDir          = "/tmp/codhoot-cache"
 	gocacheDir        = "/tmp/gocache"
@@ -188,11 +188,12 @@ func runCommand(parent context.Context, timeout time.Duration, dir string, uid u
 	full := append([]string{sandboxExecFlag, name}, args...)
 	cmd := exec.CommandContext(ctx, self, full...)
 	cmd.Dir = dir
+	// GOCACHE comes from the image (shared and pre-warmed with the stdlib)
+	// rather than being per-job: a per-job cache is cold on every request and
+	// made each compile rebuild the entire standard library. GOTMPDIR stays
+	// per-job so scratch writes remain inside the private job directory.
 	cmd.Env = childEnv(dir,
-		"GOCACHE="+filepath.Join(dir, ".gocache"),
 		"GOTMPDIR="+dir,
-		"GOPROXY=off",
-		"GOFLAGS=-mod=mod",
 		"GONOSUMDB=*",
 		"GOSUMDB=off")
 	cmd.SysProcAttr = hardenProcAttr(uid)

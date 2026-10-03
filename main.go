@@ -122,7 +122,9 @@ func main() {
 	log.Println("Go found, ready to compile")
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /compile", handleCompile)
+	// Only POST /compile is authenticated. /health and /health/live must stay
+	// open or Render marks the service unhealthy and restarts it in a loop.
+	mux.Handle("POST /compile", VerifyHMAC(http.HandlerFunc(handleCompile)))
 	mux.HandleFunc("GET /health/live", handleHealth)
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /", handleIndex)

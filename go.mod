@@ -1,3 +1,3 @@
-module github.com/codhoot/codhoot-go-service
+module github.com/avadhutdkatkar112-collab/codhoot-go-service
 
 go 1.26
